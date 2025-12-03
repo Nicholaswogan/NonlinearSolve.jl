@@ -7,6 +7,7 @@ Pkg.activate(ROOT)
 Pkg.develop(PackageSpec(path = normpath(ROOT, "lib", "NonlinearSolveFirstOrder")))
 Pkg.instantiate()
 
+using BenchmarkTools
 using LinearAlgebra
 using NonlinearSolveFirstOrder
 using SciMLBase
@@ -33,9 +34,8 @@ function main()
     prob = NonlinearProblem(f, u0, nothing)
     alg = TrustRegion(radius_update_scheme = RadiusUpdateSchemes.NLsolve)
 
-    t_start = time()
     sol = solve(prob, alg; abstol = 1e-10, reltol = 1e-10)
-    elapsed = time() - t_start
+    elapsed = @belapsed solve($prob, $alg; abstol = 1e-10, reltol = 1e-10)
     fval = prob.f(sol.u, prob.p)
 
     println("=== Julia TrustRegion (NLsolve) ===")

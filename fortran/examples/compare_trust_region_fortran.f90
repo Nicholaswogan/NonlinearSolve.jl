@@ -5,29 +5,41 @@ program compare_trust_region_fortran
 
     integer, parameter :: dp = real64
     integer, parameter :: n = 2
-    real(dp) :: u(n) = [1.5_dp, -0.5_dp]
+    integer, parameter :: reps = 100
+    real(dp) :: u(n), u0(n)
     real(dp) :: p(0)
     type(trust_region_opts) :: opts
     type(trust_region_stats) :: stats
     real(dp) :: t_start, t_end, fnorm
     real(dp) :: fval(n)
+    real(dp) :: total_time
+    integer :: k
 
     opts%max_iters = 100
     opts%abs_tol = 1.0e-10_dp
     opts%rel_tol = 1.0e-10_dp
 
+    u0 = [1.5_dp, -0.5_dp]
+    total_time = 0.0_dp
+
+    ! Run once for stats and accumulate timing over multiple repeats.
     call cpu_time(t_start)
-    call trust_region_solve(residual, jacobian, n, u, p, opts, stats)
+    do k = 1, reps
+        u = u0
+        stats = trust_region_stats()
+        call trust_region_solve(residual, jacobian, n, u, p, opts, stats)
+    end do
     call cpu_time(t_end)
+    total_time = t_end - t_start
 
     call residual(n, u, p, fval)
     fnorm = vec_norm2_local(fval)
 
     print *, "=== Fortran TrustRegion (NLsolve) ==="
-    print '(a,2f14.8)', "solution u =", u
-    print '(a,f14.8)', "||u|| =", vec_norm2_local(u)
-    print '(a,f14.8)', "||f(u)|| =", fnorm
-    print '(a,f14.8)', "solve time (s) =", t_end - t_start
+    print '(a,2es24.16)', "solution u =", u
+    print '(a,es24.16)', "||u|| =", vec_norm2_local(u)
+    print '(a,es24.16)', "||f(u)|| =", fnorm
+    print '(a,es24.16)', "avg solve time (s) =", total_time / real(reps, dp)
     print '(a,i6)', "retcode =", stats%retcode
     print '(a,i6)', "iters =", stats%iters
     print '(a,i6)', "func evals =", stats%func_evals
