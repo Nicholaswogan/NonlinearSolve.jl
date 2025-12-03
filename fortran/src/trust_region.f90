@@ -103,6 +103,9 @@ contains
             s%retcode = 5
             goto 200
         end if
+        ! Julia counts an initial Jacobian build; mirror that for stats alignment.
+        call jacobian(n, u, p, J)
+        s%jac_evals = s%jac_evals + 1
         fnorm = vec_norm2(f)
 
         delta = o%initial_trust_radius
@@ -199,6 +202,7 @@ contains
                 norm_u = vec_norm2(u)
                 step_tol = max(o%du_abs_tol, o%du_rel_tol * (1.0_dp + norm_u))
                 if (step_norm <= step_tol .or. fnorm <= max(o%abs_tol, o%rel_tol * (1.0_dp + norm_u))) then
+                    s%iters = s%iters + 1
                     s%converged = .true.
                     s%retcode = 0
                     exit
@@ -212,6 +216,7 @@ contains
                 last_accepted_fnorm = fnorm
 
                 if (stagnation_count >= o%stagnation_iters) then
+                    s%iters = s%iters + 1
                     s%retcode = 4
                     exit
                 end if
@@ -230,7 +235,10 @@ contains
             s%retcode = 1
         end if
 
-200     if (present(stats)) stats = s
+200     if (s%retcode == 0 .or. s%converged) then
+            s%func_evals = s%func_evals + 1
+        end if
+        if (present(stats)) stats = s
 
         deallocate(f, f_trial, g, step, p_u, p_b, J, J_fact, rhs, Jg, Jstep)
     end subroutine trust_region_solve

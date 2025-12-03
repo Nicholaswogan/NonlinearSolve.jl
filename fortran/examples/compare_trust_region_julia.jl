@@ -1,6 +1,11 @@
 #!/usr/bin/env julia
 using Pkg
-Pkg.activate(joinpath(@__DIR__, "..", ".."))
+
+const ROOT = normpath(@__DIR__, "..", "..")
+Pkg.activate(ROOT)
+# Ensure the local NonlinearSolveFirstOrder package is available when running from source.
+Pkg.develop(PackageSpec(path = normpath(ROOT, "lib", "NonlinearSolveFirstOrder")))
+Pkg.instantiate()
 
 using LinearAlgebra
 using NonlinearSolveFirstOrder
@@ -31,18 +36,20 @@ function main()
     t_start = time()
     sol = solve(prob, alg; abstol = 1e-10, reltol = 1e-10)
     elapsed = time() - t_start
+    fval = prob.f(sol.u, prob.p)
 
     println("=== Julia TrustRegion (NLsolve) ===")
     println("solution u =", sol.u)
     println("||u|| =", norm(sol.u))
+    println("||f(u)|| =", norm(fval))
     println("solve time (s) =", elapsed)
     println("retcode =", sol.retcode)
-    println("iters =", get_or(sol, :iters))
+    println("iters =", get_or(sol.stats, :nsteps))
     println("func evals =", get_or(sol.stats, :nf))
-    println("jac evals =", get_or(sol.stats, :nfJ))
+    println("jac evals =", get_or(sol.stats, :njacs))
     println("lin solves =", get_or(sol.stats, :nsolve))
-    println("trace length =", length(sol.trace))
-    println("stats fields =", propertynames(sol.stats))
+    println("shrink counter =", "n/a")
+    println("converged =", sol.retcode == SciMLBase.ReturnCode.Success)
 end
 
 get_or(x, name) = Base.hasproperty(x, name) ? getproperty(x, name) : "n/a"
