@@ -1,0 +1,347 @@
+module trust_region_nls
+    use iso_fortran_env, only: real64
+    use, intrinsic :: ieee_arithmetic
+    implicit none
+    private
+
+    integer, parameter :: dp = real64
+
+    public :: trust_region_opts, trust_region_stats, trust_region_solve
+
+    type :: trust_region_opts
+        integer :: max_iters = 100
+        integer :: max_shrink_times = 32
+        real(dp) :: abs_tol = 1.0e-8_dp
+        real(dp) :: rel_tol = 1.0e-8_dp
+        real(dp) :: du_abs_tol = 1.0e-10_dp
+        real(dp) :: du_rel_tol = 1.0e-10_dp
+        real(dp) :: stagnation_tol = 1.0e-12_dp
+        integer :: stagnation_iters = 5
+        real(dp) :: initial_trust_radius = -1.0_dp
+        real(dp) :: max_trust_radius = huge(1.0_dp)
+        real(dp) :: step_threshold = 1.0e-4_dp
+        real(dp) :: shrink_threshold = 0.05_dp
+        real(dp) :: expand_threshold = 0.9_dp
+        real(dp) :: shrink_factor = 0.5_dp
+        real(dp) :: expand_factor = 2.0_dp
+    end type trust_region_opts
+
+    type :: trust_region_stats
+        integer :: iters = 0
+        integer :: shrink_steps = 0
+        integer :: func_evals = 0
+        integer :: jac_evals = 0
+        integer :: lin_solves = 0
+        logical :: converged = .false.
+        integer :: retcode = 0
+    end type trust_region_stats
+
+    abstract interface
+        subroutine residual_fun(n, u, p, f)
+            import dp
+            integer, intent(in) :: n
+            real(dp), intent(in) :: u(n), p(:)
+            real(dp), intent(out) :: f(n)
+        end subroutine residual_fun
+
+        subroutine jacobian_fun(n, u, p, J)
+            import dp
+            integer, intent(in) :: n
+            real(dp), intent(in) :: u(n), p(:)
+            real(dp), intent(out) :: J(n, n)
+        end subroutine jacobian_fun
+    end interface
+
+    interface
+        subroutine dgesv(n, nrhs, a, lda, ipiv, b, ldb, info)
+            use iso_fortran_env, only: real64
+            integer, intent(in) :: n, nrhs, lda, ldb
+            integer, intent(out) :: ipiv(*)
+            real(real64), intent(inout) :: a(lda, *)
+            real(real64), intent(inout) :: b(ldb, *)
+            integer, intent(out) :: info
+        end subroutine dgesv
+    end interface
+
+contains
+
+    subroutine trust_region_solve(residual, jacobian, n, u, p, opts, stats)
+        procedure(residual_fun) :: residual
+        procedure(jacobian_fun) :: jacobian
+        integer, intent(in) :: n
+        real(dp), intent(inout) :: u(n)
+        real(dp), intent(in) :: p(:)
+        type(trust_region_opts), intent(in), optional :: opts
+        type(trust_region_stats), intent(inout), optional :: stats
+
+        type(trust_region_opts) :: o
+        type(trust_region_stats) :: s
+
+        real(dp), allocatable :: f(:), f_trial(:), g(:), step(:), p_u(:), p_b(:)
+        real(dp), allocatable :: J(:, :), J_fact(:, :), rhs(:), Jg(:), Jstep(:)
+        real(dp) :: delta, fnorm, fnorm_trial, rho, predicted, numerator
+        real(dp) :: step_norm
+        integer :: info
+        integer :: shrink_counter
+        logical :: accept_step
+        logical :: recompute_jacobian, tried_recompute
+        real(dp) :: step_tol, norm_u
+        real(dp) :: last_accepted_fnorm
+        integer :: stagnation_count
+
+        o = trust_region_opts()
+        if (present(opts)) o = opts
+        s = trust_region_stats()
+        if (present(stats)) s = stats
+
+        allocate(f(n), f_trial(n), g(n), step(n), p_u(n), p_b(n))
+        allocate(J(n, n), J_fact(n, n), rhs(n), Jg(n), Jstep(n))
+
+        call residual(n, u, p, f)
+        s%func_evals = s%func_evals + 1
+        if (.not. is_finite_vec(f)) then
+            s%retcode = 5
+            goto 200
+        end if
+        fnorm = vec_norm2(f)
+
+        delta = o%initial_trust_radius
+        if (delta <= 0.0_dp) delta = max(vec_norm2(u), 1.0_dp)
+        delta = min(delta, o%max_trust_radius)
+
+        shrink_counter = 0
+        recompute_jacobian = .true.
+        stagnation_count = 0
+        last_accepted_fnorm = fnorm
+
+        do while (s%iters < o%max_iters)
+            norm_u = vec_norm2(u)
+            if (fnorm <= max(o%abs_tol, o%rel_tol * (1.0_dp + norm_u))) then
+                s%converged = .true.
+                s%retcode = 0
+                exit
+            end if
+
+            if (recompute_jacobian) then
+                call jacobian(n, u, p, J)
+                s%jac_evals = s%jac_evals + 1
+                if (.not. is_finite_mat(J)) then
+                    s%retcode = 5
+                    goto 200
+                end if
+            end if
+
+            g = matmul(transpose(J), f)
+            Jg = matmul(J, g)
+
+            rhs = -f
+            J_fact = J
+            tried_recompute = .false.
+            solve_attempt: do
+                call solve_linear_system(n, J_fact, rhs, info)
+                s%lin_solves = s%lin_solves + 1
+                if (info /= 0) then
+                    if (.not. tried_recompute .and. .not. recompute_jacobian) then
+                        recompute_jacobian = .true.
+                        tried_recompute = .true.
+                        call jacobian(n, u, p, J)
+                        s%jac_evals = s%jac_evals + 1
+                        J_fact = J
+                        rhs = -f
+                        cycle solve_attempt
+                    else
+                        s%retcode = 2
+                        exit solve_attempt
+                    end if
+                else
+                    exit solve_attempt
+                end if
+            end do solve_attempt
+
+            p_b = rhs
+            call dogleg_step(g, Jg, p_b, delta, step)
+
+            step_norm = vec_norm2(step)
+            f_trial = f
+            call residual(n, u + step, p, f_trial)
+            s%func_evals = s%func_evals + 1
+            if (.not. is_finite_vec(f_trial)) then
+                s%retcode = 5
+                goto 200
+            end if
+            fnorm_trial = vec_norm2(f_trial)
+
+            Jstep = matmul(J, step)
+            predicted = dot_product(step, g) + 0.5_dp * dot_product(Jstep, Jstep)
+            if (abs(predicted) < tiny(predicted)) predicted = sign(tiny(1.0_dp), predicted + tiny(1.0_dp))
+            if (.not. ieee_is_finite(predicted)) then
+                s%retcode = 5
+                goto 200
+            end if
+
+            numerator = (fnorm_trial * fnorm_trial - fnorm * fnorm) / 2.0_dp
+            rho = numerator / predicted
+            if (.not. ieee_is_finite(rho)) then
+                s%retcode = 5
+                goto 200
+            end if
+
+            call update_radius_nlsolve(rho, step_norm, delta, shrink_counter, o)
+            accept_step = (rho > o%step_threshold)
+            s%shrink_steps = shrink_counter
+
+            if (accept_step) then
+                u = u + step
+                f = f_trial
+                fnorm = fnorm_trial
+                recompute_jacobian = .true.
+
+                norm_u = vec_norm2(u)
+                step_tol = max(o%du_abs_tol, o%du_rel_tol * (1.0_dp + norm_u))
+                if (step_norm <= step_tol .or. fnorm <= max(o%abs_tol, o%rel_tol * (1.0_dp + norm_u))) then
+                    s%converged = .true.
+                    s%retcode = 0
+                    exit
+                end if
+
+                if ((last_accepted_fnorm - fnorm) <= o%stagnation_tol * max(1.0_dp, last_accepted_fnorm)) then
+                    stagnation_count = stagnation_count + 1
+                else
+                    stagnation_count = 0
+                end if
+                last_accepted_fnorm = fnorm
+
+                if (stagnation_count >= o%stagnation_iters) then
+                    s%retcode = 4
+                    exit
+                end if
+            end if
+
+            if (shrink_counter > o%max_shrink_times) then
+                s%retcode = 3
+                exit
+            end if
+
+            s%iters = s%iters + 1
+            if (.not. accept_step) recompute_jacobian = .false.
+        end do
+
+        if (.not. s%converged .and. s%retcode == 0) then
+            s%retcode = 1
+        end if
+
+200     if (present(stats)) stats = s
+
+        deallocate(f, f_trial, g, step, p_u, p_b, J, J_fact, rhs, Jg, Jstep)
+    end subroutine trust_region_solve
+
+    subroutine solve_linear_system(n, A, b, info)
+        integer, intent(in) :: n
+        real(dp), intent(inout) :: A(n, n)
+        real(dp), intent(inout) :: b(n)
+        integer, intent(out) :: info
+
+        integer :: ipiv(n)
+
+        call dgesv(n, 1, A, n, ipiv, b, n, info)
+    end subroutine solve_linear_system
+
+    subroutine dogleg_step(g, Jg, newton_step, delta, step_out)
+        real(dp), intent(in) :: g(:)
+        real(dp), intent(in) :: Jg(:)
+        real(dp), intent(in) :: newton_step(:)
+        real(dp), intent(in) :: delta
+        real(dp), intent(out) :: step_out(:)
+
+        real(dp) :: g_norm2, Jg_norm2, alpha_sd
+        real(dp) :: p_u_norm, p_b_norm, tau, a, b, c, disc
+        real(dp), allocatable :: p_u(:), diff(:)
+
+        allocate(p_u(size(g)), diff(size(g)))
+
+        g_norm2 = dot_product(g, g)
+        Jg_norm2 = dot_product(Jg, Jg)
+
+        if (g_norm2 <= tiny(1.0_dp)) then
+            step_out = 0.0_dp
+            deallocate(p_u, diff)
+            return
+        end if
+
+        alpha_sd = g_norm2 / max(Jg_norm2, tiny(1.0_dp))
+        p_u = -alpha_sd * g
+        p_u_norm = vec_norm2(p_u)
+        p_b_norm = vec_norm2(newton_step)
+
+        if (p_b_norm <= delta) then
+            step_out = newton_step
+        else if (p_u_norm >= delta) then
+            step_out = -(delta / sqrt(g_norm2)) * g
+        else
+            diff = newton_step - p_u
+            a = dot_product(diff, diff)
+            b = 2.0_dp * dot_product(p_u, diff)
+            c = dot_product(p_u, p_u) - delta * delta
+            disc = max(0.0_dp, b * b - 4.0_dp * a * c)
+            tau = (-b + sqrt(disc)) / (2.0_dp * a)
+            tau = max(0.0_dp, min(1.0_dp, tau))
+            step_out = p_u + tau * diff
+        end if
+
+        deallocate(p_u, diff)
+    end subroutine dogleg_step
+
+    subroutine update_radius_nlsolve(rho, step_norm, delta, shrink_counter, o)
+        real(dp), intent(in) :: rho
+        real(dp), intent(in) :: step_norm
+        real(dp), intent(inout) :: delta
+        integer, intent(inout) :: shrink_counter
+        type(trust_region_opts), intent(in) :: o
+
+        if (rho < o%shrink_threshold) then
+            delta = delta * o%shrink_factor
+            shrink_counter = shrink_counter + 1
+        else
+            shrink_counter = 0
+            if (rho >= o%expand_threshold) then
+                delta = o%expand_factor * step_norm
+            else if (rho >= 0.5_dp) then
+                delta = max(delta, o%expand_factor * step_norm)
+            end if
+        end if
+
+        delta = min(delta, o%max_trust_radius)
+    end subroutine update_radius_nlsolve
+
+    pure real(dp) function vec_norm2(x)
+        real(dp), intent(in) :: x(:)
+        vec_norm2 = sqrt(dot_product(x, x))
+    end function vec_norm2
+
+    pure logical function is_finite_vec(x)
+        real(dp), intent(in) :: x(:)
+        integer :: i
+        is_finite_vec = .true.
+        do i = 1, size(x)
+            if (.not. ieee_is_finite(x(i))) then
+                is_finite_vec = .false.
+                return
+            end if
+        end do
+    end function is_finite_vec
+
+    pure logical function is_finite_mat(x)
+        real(dp), intent(in) :: x(:, :)
+        integer :: i, j
+        is_finite_mat = .true.
+        do j = 1, size(x, 2)
+            do i = 1, size(x, 1)
+                if (.not. ieee_is_finite(x(i, j))) then
+                    is_finite_mat = .false.
+                    return
+                end if
+            end do
+        end do
+    end function is_finite_mat
+
+end module trust_region_nls
