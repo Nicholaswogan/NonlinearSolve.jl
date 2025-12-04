@@ -1,4 +1,4 @@
-module trust_region_nls
+module nonlinearsolve
     use iso_fortran_env, only: real64
     use, intrinsic :: ieee_arithmetic
     implicit none
@@ -643,4 +643,4 @@ solve_attempt_newton: do
         end if
     end function compute_alpha_backtracking_cubic
 
-end module trust_region_nls
+end module nonlinearsolve

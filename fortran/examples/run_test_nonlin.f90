@@ -1,6 +1,6 @@
 program run_test_nonlin
     use iso_fortran_env, only: real64
-    use trust_region_nls
+    use nonlinearsolve
     use minpack_module, only: hybrj1, wp
     implicit none
 

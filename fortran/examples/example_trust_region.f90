@@ -1,6 +1,6 @@
 program example_trust_region
     use iso_fortran_env, only: real64
-    use trust_region_nls
+    use nonlinearsolve
     implicit none
 
     integer, parameter :: dp = real64

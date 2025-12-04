@@ -1,6 +1,6 @@
 program compare_newton_fortran
     use iso_fortran_env, only: real64
-    use trust_region_nls
+    use nonlinearsolve
     implicit none
 
     integer, parameter :: dp = real64
