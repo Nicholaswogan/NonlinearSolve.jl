@@ -1,7 +1,6 @@
 program run_test_nonlin
     use iso_fortran_env, only: real64
     use nonlinearsolve
-    use minpack_module, only: hybrj1, wp
     implicit none
 
     integer, parameter :: dp = real64
@@ -15,14 +14,9 @@ program run_test_nonlin
     type(trust_region_stats) :: stats
     type(newton_opts) :: nopts, nopts_bt
     type(newton_stats) :: nstats, nstats_bt
-    real(dp) :: t_start, t_end, fnorm_tr, fnorm_mp, fnorm_nr, fnorm_nr_bt
-    real(dp) :: avg_time_tr, avg_time_mp, avg_time_nr, avg_time_nr_bt
+    real(dp) :: t_start, t_end, fnorm_tr, fnorm_nr, fnorm_nr_bt
+    real(dp) :: avg_time_tr, avg_time_nr, avg_time_nr_bt
     character(len=80) :: title
-    ! Minpack workspace
-    real(wp), allocatable :: x_mp(:), f_mp(:), jac_mp(:, :), wa(:)
-    real(wp) :: tol_mp
-    integer :: info_mp, lwa, ldfjac
-    integer :: mp_nfev, mp_njac
     integer :: prob_current
 
     opts%abs_tol = 1.0e-10_dp
@@ -90,34 +84,14 @@ program run_test_nonlin
         call residual_wrapper(u, f)
         fnorm_nr_bt = sqrt(sum(f * f))
 
-        ! Minpack hybrj1 runs
-        allocate(x_mp(n), f_mp(n), jac_mp(n, n))
-        ldfjac = n
-        lwa = (n * (n + 13)) / 2
-        allocate(wa(lwa))
-        tol_mp = 1.0e-10_wp
-        call cpu_time(t_start)
-        do k = 1, reps
-            x_mp = real(u0, kind = wp)
-            mp_nfev = 0
-            mp_njac = 0
-            call hybrj1(fcn_hybrj_wrapper, n, x_mp, f_mp, jac_mp, ldfjac, tol_mp, info_mp, wa, lwa)
-        end do
-        call cpu_time(t_end)
-        avg_time_mp = (t_end - t_start) / real(reps, dp)
-        call p00_fx(prob, n, real(x_mp, kind = dp), f)
-        fnorm_mp = sqrt(sum(f * f))
-
         write (*,'(1x,i4,1x,"|",1x,i4,1x,"|",1x,a8,1x,"|",1x,i4,1x,"|",1x,i6,1x,"|",1x,i6,1x,"|",1x,i7,1x,"|",1x,i4,1x,"|",1x,es10.3,1x,"|",1x,es10.3,1x,"|",1x,a)') &
             prob, n, "TR", stats%retcode, stats%func_evals, stats%jac_evals, stats%lin_solves, 0, avg_time_tr, fnorm_tr, trim(title)
         write (*,'(1x,i4,1x,"|",1x,i4,1x,"|",1x,a8,1x,"|",1x,i4,1x,"|",1x,i6,1x,"|",1x,i6,1x,"|",1x,i7,1x,"|",1x,i4,1x,"|",1x,es10.3,1x,"|",1x,es10.3,1x,"|",1x,a)') &
             prob, n, "NR", nstats%retcode, nstats%func_evals, nstats%jac_evals, nstats%lin_solves, nstats%backtrack_steps, avg_time_nr, fnorm_nr, trim(title)
         write (*,'(1x,i4,1x,"|",1x,i4,1x,"|",1x,a8,1x,"|",1x,i4,1x,"|",1x,i6,1x,"|",1x,i6,1x,"|",1x,i7,1x,"|",1x,i4,1x,"|",1x,es10.3,1x,"|",1x,es10.3,1x,"|",1x,a)') &
             prob, n, "NR_BT", nstats_bt%retcode, nstats_bt%func_evals, nstats_bt%jac_evals, nstats_bt%lin_solves, nstats_bt%backtrack_steps, avg_time_nr_bt, fnorm_nr_bt, trim(title)
-        write (*,'(1x,i4,1x,"|",1x,i4,1x,"|",1x,a8,1x,"|",1x,i4,1x,"|",1x,i6,1x,"|",1x,i6,1x,"|",1x,i7,1x,"|",1x,i4,1x,"|",1x,es10.3,1x,"|",1x,es10.3,1x,"|",1x,a)') &
-            prob, n, "MP", info_mp, mp_nfev, mp_njac, 0, 0, avg_time_mp, fnorm_mp, trim(title)
 
-        deallocate(u, u0, f, J, x_mp, f_mp, jac_mp, wa)
+        deallocate(u, u0, f, J)
     end do
 
 contains
@@ -137,28 +111,5 @@ contains
         nloc = size(u)
         call p00_jac(prob_current, nloc, u, Jout)
     end subroutine jac_wrapper
-
-    subroutine fcn_hybrj_wrapper(n, x, fvec, fjac, ldfjac, iflag)
-        use iso_fortran_env, only: real64
-        integer, intent(in) :: n, ldfjac
-        real(wp), intent(in) :: x(n)
-        real(wp), intent(inout) :: fvec(n)
-        real(wp), intent(inout) :: fjac(ldfjac, n)
-        integer, intent(inout) :: iflag
-        real(real64), allocatable :: xtmp(:)
-
-        allocate(xtmp(n))
-        xtmp = real(x, kind = real64)
-
-        if (iflag == 1) then
-            call p00_fx(prob_current, n, xtmp, fvec)
-            mp_nfev = mp_nfev + 1
-        else if (iflag == 2) then
-            call p00_jac(prob_current, n, xtmp, fjac)
-            mp_njac = mp_njac + 1
-        end if
-
-        deallocate(xtmp)
-    end subroutine fcn_hybrj_wrapper
 
 end program run_test_nonlin
