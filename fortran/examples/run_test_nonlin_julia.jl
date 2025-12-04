@@ -14,6 +14,36 @@ using Printf
 using SciMLBase
 
 const REPS = 100
+const FORTRAN_N = [
+    -2, 4, 2, 4, 3, -2, 9, -1, -1, -1, -1, -1, -1, -1, 4, 9, 2, 2, 2, 1, 2, 2, -1
+]
+
+# Burkardt starts truncated/padded to length n.
+const FORTRAN_STARTS = (
+    [-1.2, 1.0],
+    [3.0, -1.0, 0.0, 1.0],
+    [0.0, 1.0],
+    [-3.0, -1.0, -3.0, -1.0],
+    [-1.0, 0.0, 0.0],
+    [0.0, 0.0],
+    [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+    [0.5],  # will be padded if n > 1
+    [0.0],  # will be padded if n > 1
+    [0.0],  # pad
+    [1.0],  # pad
+    [0.0],  # pad
+    [-1.0], # pad
+    [-1.0], # pad
+    [0.0, 0.0, 0.0, 0.0],
+    [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+    [1.0, 5.0],
+    [2.0, 2.0],
+    [3.0, 3.0],
+    [1.0],
+    [0.5, -2.0],
+    [1.0, 0.0],
+    [1.0],  # will be padded
+)
 
 function get_or(x, name, default)
     return Base.hasproperty(x, name) ? getproperty(x, name) : default
@@ -53,19 +83,74 @@ function main()
     for idx in eachindex(probs)
         prob_fun = probs[idx]
         meta = dicts[idx]
-        x0 = copy(meta["start"])
-        n = length(x0)
+        n = abs(FORTRAN_N[idx])
         title = get(meta, "title", "")
 
-        nlprob = NonlinearProblem(
-            (u, p) -> begin
+        # Align with Fortran: use n from Burkardt and truncate/pad start accordingly.
+        base_start = FORTRAN_STARTS[idx]
+        if length(base_start) >= n
+            x0 = copy(base_start[1:n])
+        else
+            x0 = vcat(base_start, zeros(eltype(base_start), n - length(base_start)))
+        end
+
+        local f
+        if idx == 9
+            f = function (u, p)
+                out = similar(u)
+                h = 1.0 / (length(u) + 1)
+                for k in eachindex(u)
+                    out[k] = 2.0 * u[k] + 0.5 * h * h * (u[k] + k * h + 1.0)^3
+                    if k > 1
+                        out[k] -= u[k - 1]
+                    end
+                    if k < length(u)
+                        out[k] -= u[k + 1]
+                    end
+                end
+                return out
+            end
+        elseif idx == 13
+            f = function (u, p)
+                nloc = length(u)
+                out = similar(u)
+                for k in 1:nloc
+                    out[k] = (3.0 - 2.0 * u[k]) * u[k] + 1.0
+                    if k > 1
+                        out[k] -= u[k - 1]
+                    end
+                    if k < nloc
+                        out[k] -= 2.0 * u[k + 1]
+                    end
+                end
+                return out
+            end
+        elseif idx == 23
+            f = function (u, p)
+                nloc = length(u)
+                out = similar(u)
+                out .= u
+                c = 0.9
+                mu = [(2.0 * i) / (2.0 * nloc) for i in 1:nloc]
+                for i in 1:nloc
+                    s = 0.0
+                    for j in 1:nloc
+                        s += (mu[i] * u[j]) / (mu[i] + mu[j])
+                    end
+                    term = 1.0 - c * s / (2.0 * nloc)
+                    out[i] -= 1.0 / term
+                end
+                return out
+            end
+        else
+            f = (u, p) -> begin
                 out = similar(u)
                 prob_fun(out, u, nothing)
                 out
-            end,
-            x0,
-            nothing,
-        )
+            end
+        end
+
+        nlprob = NonlinearProblem(f, x0, nothing)
 
         tr_res = run_solver(nlprob, alg_tr; bt_steps_default = 0)
         nr_res = run_solver(nlprob, alg_nr; bt_steps_default = 0)
