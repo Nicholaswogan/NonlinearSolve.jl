@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Generate a plot comparing trust_region_solve vs MINPACK hybrj1 on the Burkardt test set.
+Generate a plot comparing TrustRegion, Newton (with/without backtracking), and
+MINPACK hybrj1 on the Burkardt test set.
 
 The script runs the built executable ../../build/run_test_nonlin, parses its table output,
-and produces a PNG with side-by-side bar charts for average runtime and final residual norm.
+and produces a PNG with grouped bar charts for average runtime and final residual norm.
 """
 
 import re
@@ -16,45 +17,42 @@ import matplotlib.pyplot as plt
 
 def parse_table(text: str):
     rows = []
-    for line in text.splitlines():
-        if not line.strip():
-            continue
-        if line.lstrip().startswith("problem") or line.lstrip().startswith("-"):
-            continue
-        # Strip column separators then split.
-        parts = line.replace("|", " ").split()
-        if len(parts) < 13:
-            continue
 
-        def parse_float(val: str) -> float:
-            v = val.replace("D", "E")
-            if re.match(r"^[+-]?\d*\.\d*(?:[eE][+-]?\d+)?$", v):
-                return float(v)
+    def parse_float(val: str) -> float:
+        v = val.replace("D", "E")
+        try:
+            return float(v)
+        except ValueError:
             m = re.match(r"^([+-]?\d*\.\d*)([+-]\d+)$", v)
             if m:
                 return float(f"{m.group(1)}E{m.group(2)}")
-            return float(v)
+            raise
 
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        if line.lstrip().startswith("prob") or line.lstrip().startswith("-"):
+            continue
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) < 11:
+            continue
         try:
             rows.append(
                 {
                     "problem": int(parts[0]),
                     "n": int(parts[1]),
-                    "tr_ret": int(parts[2]),
-                    "tr_nf": int(parts[3]),
-                    "tr_njac": int(parts[4]),
-                    "tr_nsolve": int(parts[5]),
-                    "tr_time": parse_float(parts[6]),
-                    "tr_fnorm": parse_float(parts[7]),
-                    "mp_ret": int(parts[8]),
-                    "mp_nf": int(parts[9]),
-                    "mp_njac": int(parts[10]),
-                    "mp_time": parse_float(parts[11]),
-                    "mp_fnorm": parse_float(parts[12]),
+                    "solver": parts[2],
+                    "ret": int(parts[3]),
+                    "nf": int(parts[4]),
+                    "njac": int(parts[5]),
+                    "nsolve": int(parts[6]),
+                    "bt": int(parts[7]),
+                    "time": parse_float(parts[8]),
+                    "fnorm": parse_float(parts[9]),
+                    "title": parts[10],
                 }
             )
         except ValueError:
-            # Skip lines that don't parse cleanly (e.g., headers)
             continue
     return rows
 
@@ -78,37 +76,84 @@ def main():
     titles = parse_titles(titles_path) if titles_path.exists() else {}
 
     result = subprocess.run([str(exe)], capture_output=True, text=True, check=True)
-    rows = parse_table(result.stdout)
-    if not rows:
+    raw_rows = parse_table(result.stdout)
+    if not raw_rows:
         print("No rows parsed; check the run_test_nonlin output.", file=sys.stderr)
         sys.exit(1)
 
-    problems = [r["problem"] for r in rows]
-    labels = [f"{p}: {titles.get(p, '')}".strip().rstrip(":") for p in problems]
-    tr_time = [r["tr_time"] for r in rows]
-    mp_time = [r["mp_time"] for r in rows]
-    tr_f = [r["tr_fnorm"] for r in rows]
-    mp_f = [r["mp_fnorm"] for r in rows]
-    tr_ret = [r["tr_ret"] for r in rows]
-    mp_ret = [r["mp_ret"] for r in rows]
+    # Group by problem -> solver
+    grouped = {}
+    for r in raw_rows:
+        grouped.setdefault(r["problem"], {})[r["solver"]] = r
+
+    solver_order = ["TR", "NR", "NR_BT", "MP"]
+    problems = sorted(grouped.keys())
+    labels = []
+    for p in problems:
+        if grouped.get(p) and grouped[p].get("TR"):
+            labels.append(f"{p}: {grouped[p]['TR'].get('title','')}".strip().rstrip(":"))
+        else:
+            labels.append(f"{p}: {titles.get(p, '')}".strip().rstrip(":"))
+
+    def get_or_nan(prob, solver, key):
+        entry = grouped.get(prob, {}).get(solver)
+        return entry.get(key) if entry else float("nan")
+
+    data = {s: {"time": [], "fnorm": [], "ret": []} for s in solver_order}
+    for p in problems:
+        for s in solver_order:
+            data[s]["time"].append(get_or_nan(p, s, "time"))
+            data[s]["fnorm"].append(get_or_nan(p, s, "fnorm"))
+            data[s]["ret"].append(get_or_nan(p, s, "ret"))
 
     x = range(len(problems))
-    width = 0.4
+    width = 0.18
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
 
-    tr_colors = ["#4c72b0" if r == 0 else "#c44e52" for r in tr_ret]
-    mp_colors = ["#55a868" if r == 1 else "#c44e52" for r in mp_ret]
+    base_colors = {
+        "TR": "#4c72b0",
+        "NR": "#dd8452",
+        "NR_BT": "#55a868",
+        "MP": "#9370db",
+    }
 
-    ax1.bar([i - width / 2 for i in x], tr_time, width, label="TrustRegion", color=tr_colors)
-    ax1.bar([i + width / 2 for i in x], mp_time, width, label="MINPACK hybrj1", color=mp_colors)
+    def colors_for(solver):
+        retcodes = data[solver]["ret"]
+        colors = []
+        for r in retcodes:
+            success = (solver == "MP" and r == 1) or (solver != "MP" and r == 0)
+            colors.append(base_colors[solver] if success else "#c44e52")
+        return colors
+
+    offsets = {
+        "TR": -1.5 * width,
+        "NR": -0.5 * width,
+        "NR_BT": 0.5 * width,
+        "MP": 1.5 * width,
+    }
+
+    for solver in solver_order:
+        ax1.bar(
+            [i + offsets[solver] for i in x],
+            data[solver]["time"],
+            width,
+            label=solver,
+            color=colors_for(solver),
+        )
     ax1.set_ylabel("avg time (s)")
     ax1.set_yscale("log")
     ax1.legend()
     ax1.grid(True, axis="y", alpha=0.3)
 
-    ax2.bar([i - width / 2 for i in x], tr_f, width, label="TrustRegion", color=tr_colors)
-    ax2.bar([i + width / 2 for i in x], mp_f, width, label="MINPACK hybrj1", color=mp_colors)
+    for solver in solver_order:
+        ax2.bar(
+            [i + offsets[solver] for i in x],
+            data[solver]["fnorm"],
+            width,
+            label=solver,
+            color=colors_for(solver),
+        )
     ax2.set_ylabel("||f(u)||")
     ax2.set_xlabel("problem")
     ax2.set_xticks(list(x))
