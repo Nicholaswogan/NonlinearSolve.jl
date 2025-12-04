@@ -7,6 +7,7 @@ module trust_region_nls
     integer, parameter :: dp = real64
 
     public :: trust_region_opts, trust_region_stats, trust_region_solve
+    public :: newton_opts, newton_stats, newton_solve
 
     type :: trust_region_opts
         integer :: max_iters = 100
@@ -16,7 +17,7 @@ module trust_region_nls
         real(dp) :: du_abs_tol = 1.0e-10_dp
         real(dp) :: du_rel_tol = 1.0e-10_dp
         real(dp) :: stagnation_tol = 1.0e-12_dp
-        integer :: stagnation_iters = 5
+        integer :: stagnation_iters = 10
         real(dp) :: initial_trust_radius = -1.0_dp
         real(dp) :: max_trust_radius = huge(1.0_dp)
         real(dp) :: step_threshold = 1.0e-4_dp
@@ -35,6 +36,31 @@ module trust_region_nls
         logical :: converged = .false.
         integer :: retcode = 0
     end type trust_region_stats
+
+    type :: newton_opts
+        integer :: max_iters = 100
+        real(dp) :: abs_tol = 1.0e-8_dp
+        real(dp) :: rel_tol = 1.0e-8_dp
+        real(dp) :: du_abs_tol = 1.0e-10_dp
+        real(dp) :: du_rel_tol = 1.0e-10_dp
+        real(dp) :: stagnation_tol = 1.0e-12_dp
+        integer :: stagnation_iters = 10
+        logical :: use_backtracking = .false.
+        real(dp) :: bt_c1 = 1.0e-4_dp
+        real(dp) :: bt_rho_hi = 0.5_dp
+        real(dp) :: bt_rho_lo = 0.1_dp
+        integer :: bt_max_steps = 1000
+    end type newton_opts
+
+    type :: newton_stats
+        integer :: iters = 0
+        integer :: func_evals = 0
+        integer :: jac_evals = 0
+        integer :: lin_solves = 0
+        integer :: backtrack_steps = 0
+        logical :: converged = .false.
+        integer :: retcode = 0
+    end type newton_stats
 
     abstract interface
         subroutine residual_fun(u, f)
@@ -106,6 +132,7 @@ contains
         real(dp) :: step_tol, norm_u
         real(dp) :: last_accepted_fnorm
         integer :: stagnation_count
+        real(dp) :: alpha
         integer :: n
 
         o = trust_region_opts()
@@ -264,6 +291,230 @@ contains
         deallocate(f, f_trial, g, step, p_u, p_b, J, J_fact, rhs, Jg, Jstep)
     end subroutine trust_region_solve
 
+    !!> Newton solver with optional Armijo backtracking.
+    !!
+    !! Dense real-only; user supplies residual(u, f) and Jacobian(u, J).
+    !!
+    !! Retcodes: 0 success, 1 max iters, 2 linear solve fail, 3 backtracking fail,
+    !! 4 stagnation, 5 non-finite detected.
+    subroutine newton_solve(residual, jacobian, u, opts, stats)
+        procedure(residual_fun) :: residual
+        procedure(jacobian_fun) :: jacobian
+        real(dp), intent(inout) :: u(:)
+        type(newton_opts), intent(in), optional :: opts
+        type(newton_stats), intent(inout), optional :: stats
+
+        type(newton_opts) :: o
+        type(newton_stats) :: s
+
+        integer :: n, info
+        real(dp), allocatable :: f(:), f_trial(:), rhs(:)
+        real(dp), allocatable :: J(:, :), J_fact(:, :)
+        real(dp), allocatable :: Jdelta(:)
+        real(dp) :: fnorm, fnorm_trial, step_norm
+        real(dp) :: numerator
+        logical :: tried_recompute, accept_step
+        real(dp) :: step_tol, norm_u
+        real(dp) :: last_accepted_fnorm
+        integer :: stagnation_count
+        real(dp) :: alpha
+        real(dp) :: phi0, phi_x0, phi_x1, phi_tmp, alpha1, alpha2
+        integer :: iteration, max_finite_iters
+
+        o = newton_opts()
+        if (present(opts)) o = opts
+        s = newton_stats()
+        if (present(stats)) s = stats
+
+        n = size(u)
+        allocate(f(n), f_trial(n), rhs(n))
+        allocate(J(n, n), J_fact(n, n))
+        allocate(Jdelta(n))
+
+        call residual(u, f)
+        s%func_evals = s%func_evals + 1
+        if (.not. is_finite_vec(f)) then
+            s%retcode = 5
+            goto 500
+        end if
+        call jacobian(u, J)
+        s%jac_evals = s%jac_evals + 1
+        fnorm = vec_norm2(f)
+
+        stagnation_count = 0
+        last_accepted_fnorm = fnorm
+
+        do while (s%iters < o%max_iters)
+            norm_u = vec_norm2(u)
+            if (fnorm <= max(o%abs_tol, o%rel_tol * (1.0_dp + norm_u))) then
+                s%converged = .true.
+                s%retcode = 0
+                exit
+            end if
+
+            call jacobian(u, J)
+            s%jac_evals = s%jac_evals + 1
+            if (.not. is_finite_mat(J)) then
+                s%retcode = 5
+                goto 500
+            end if
+
+            rhs = -f
+            J_fact = J
+            tried_recompute = .false.
+solve_attempt_newton: do
+                call solve_linear_system(n, J_fact, rhs, info)
+                s%lin_solves = s%lin_solves + 1
+                if (info /= 0) then
+                    if (.not. tried_recompute) then
+                        tried_recompute = .true.
+                        call jacobian(u, J)
+                        s%jac_evals = s%jac_evals + 1
+                        J_fact = J
+                        rhs = -f
+                        cycle solve_attempt_newton
+                    else
+                        s%retcode = 2
+                        exit solve_attempt_newton
+                    end if
+                else
+                    exit solve_attempt_newton
+                end if
+            end do solve_attempt_newton
+            if (s%retcode == 2) exit
+
+            step_norm = vec_norm2(rhs)
+            accept_step = .true.
+
+            if (o%use_backtracking) then
+                accept_step = .false.
+                s%backtrack_steps = 0
+                Jdelta = matmul(J, rhs)
+                call residual(u, f_trial)
+                s%func_evals = s%func_evals + 1
+                if (.not. is_finite_vec(f_trial)) then
+                    s%retcode = 5
+                    goto 500
+                end if
+                phi0 = 0.5_dp * vec_norm2(f_trial)**2
+                numerator = dot_product(f_trial, Jdelta)
+
+                alpha1 = 1.0_dp
+                alpha2 = alpha1
+                call residual(u + alpha2 * rhs, f_trial)
+                s%func_evals = s%func_evals + 1
+                if (.not. is_finite_vec(f_trial)) then
+                    s%retcode = 5
+                    goto 500
+                end if
+                phi_x1 = 0.5_dp * vec_norm2(f_trial)**2
+
+                iteration = 1
+                max_finite_iters = int(-log(epsilon(1.0_dp)) / log(2.0_dp))
+                do while ((.not. ieee_is_finite(phi_x1)) .and. iteration <= max_finite_iters)
+                    alpha1 = alpha2
+                    alpha2 = alpha1 / 2
+                    call residual(u + alpha2 * rhs, f_trial)
+                    s%func_evals = s%func_evals + 1
+                    phi_x1 = 0.5_dp * vec_norm2(f_trial)**2
+                    iteration = iteration + 1
+                end do
+
+                if (phi_x1 <= phi0 + o%bt_c1 * alpha2 * numerator) then
+                    accept_step = .true.
+                    rhs = alpha2 * rhs
+                    fnorm_trial = sqrt(2 * phi_x1)
+                else
+                    phi_tmp = - (numerator * alpha2 * alpha2) / (2 * (phi_x1 - phi0 - numerator * alpha2))
+                    alpha1 = alpha2
+                    phi_tmp = min(phi_tmp, alpha2 * o%bt_rho_hi)
+                    alpha2 = max(phi_tmp, alpha2 * o%bt_rho_lo)
+                    phi_x0 = phi_x1
+                    call residual(u + alpha2 * rhs, f_trial)
+                    s%func_evals = s%func_evals + 1
+                    phi_x1 = 0.5_dp * vec_norm2(f_trial)**2
+
+                    do while (s%backtrack_steps < o%bt_max_steps)
+                        s%backtrack_steps = s%backtrack_steps + 1
+                        if (phi_x1 <= phi0 + o%bt_c1 * alpha2 * numerator) then
+                            accept_step = .true.
+                            rhs = alpha2 * rhs
+                            fnorm_trial = sqrt(2 * phi_x1)
+                            exit
+                        end if
+                        phi_tmp = compute_alpha_backtracking_cubic( &
+                            numerator, phi0, phi_x0, phi_x1, alpha1, alpha2)
+                        alpha1 = alpha2
+                        phi_tmp = min(phi_tmp, alpha2 * o%bt_rho_hi)
+                        alpha2 = max(phi_tmp, alpha2 * o%bt_rho_lo)
+                        phi_x0 = phi_x1
+                        call residual(u + alpha2 * rhs, f_trial)
+                        s%func_evals = s%func_evals + 1
+                        phi_x1 = 0.5_dp * vec_norm2(f_trial)**2
+                    end do
+                    if (.not. accept_step) then
+                        s%retcode = 3
+                        exit
+                    end if
+                end if
+            else
+                f_trial = f
+                call residual(u + rhs, f_trial)
+                s%func_evals = s%func_evals + 1
+                fnorm_trial = vec_norm2(f_trial)
+            end if
+
+            u = u + rhs
+            if (o%use_backtracking) then
+                call residual(u, f)
+                s%func_evals = s%func_evals + 1
+                if (.not. is_finite_vec(f)) then
+                    s%retcode = 5
+                    exit
+                end if
+                fnorm = vec_norm2(f)
+            else
+                f = f_trial
+                fnorm = vec_norm2(f_trial)
+            end if
+
+            norm_u = vec_norm2(u)
+            step_tol = max(o%du_abs_tol, o%du_rel_tol * (1.0_dp + norm_u))
+            if (step_norm <= step_tol .or. fnorm <= max(o%abs_tol, o%rel_tol * (1.0_dp + norm_u))) then
+                s%iters = s%iters + 1
+                s%converged = .true.
+                s%retcode = 0
+                exit
+            end if
+
+            if ((last_accepted_fnorm - fnorm) <= o%stagnation_tol * max(1.0_dp, last_accepted_fnorm)) then
+                stagnation_count = stagnation_count + 1
+            else
+                stagnation_count = 0
+            end if
+            last_accepted_fnorm = fnorm
+
+            if (stagnation_count >= o%stagnation_iters) then
+                s%iters = s%iters + 1
+                s%retcode = 4
+                exit
+            end if
+
+            s%iters = s%iters + 1
+        end do
+
+        if (.not. s%converged .and. s%retcode == 0) then
+            s%retcode = 1
+        end if
+        if (s%retcode == 0) then
+            s%func_evals = s%func_evals + 1
+        end if
+
+500     if (present(stats)) stats = s
+
+        deallocate(f, f_trial, rhs, J, J_fact, Jdelta)
+    end subroutine newton_solve
+
     subroutine solve_linear_system(n, A, b, info)
         integer, intent(in) :: n
         real(dp), intent(inout) :: A(n, n)
@@ -372,5 +623,24 @@ contains
             end do
         end do
     end function is_finite_mat
+
+    pure real(dp) function compute_alpha_backtracking_cubic(dphi0, phi0, phi_x0, phi_x1, alpha1, alpha2)
+        real(dp), intent(in) :: dphi0, phi0, phi_x0, phi_x1, alpha1, alpha2
+        real(dp) :: div, a1, a2, a, b, disc
+
+        div = 1.0_dp / (alpha1 * alpha1 * alpha2 * alpha2 * (alpha2 - alpha1))
+        a1 = alpha1 * alpha1 * (phi_x1 - phi0 - dphi0 * alpha2)
+        a2 = alpha2 * alpha2 * (phi_x0 - phi0 - dphi0 * alpha1)
+        a = (a1 - a2) * div
+        b = (-alpha1 * a1 + alpha2 * a2) * div
+
+        if (abs(a) <= tiny(1.0_dp)) then
+            compute_alpha_backtracking_cubic = dphi0 / (2 * b)
+        else
+            disc = b * b - 3 * a * dphi0
+            disc = max(disc, 0.0_dp)
+            compute_alpha_backtracking_cubic = (-b + sqrt(disc)) / (3 * a)
+        end if
+    end function compute_alpha_backtracking_cubic
 
 end module trust_region_nls
