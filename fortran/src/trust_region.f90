@@ -37,18 +37,16 @@ module trust_region_nls
     end type trust_region_stats
 
     abstract interface
-        subroutine residual_fun(n, u, p, f)
+        subroutine residual_fun(u, f)
             import dp
-            integer, intent(in) :: n
-            real(dp), intent(in) :: u(n), p(:)
-            real(dp), intent(out) :: f(n)
+            real(dp), intent(in) :: u(:)
+            real(dp), intent(out) :: f(:)
         end subroutine residual_fun
 
-        subroutine jacobian_fun(n, u, p, J)
+        subroutine jacobian_fun(u, J)
             import dp
-            integer, intent(in) :: n
-            real(dp), intent(in) :: u(n), p(:)
-            real(dp), intent(out) :: J(n, n)
+            real(dp), intent(in) :: u(:)
+            real(dp), intent(out) :: J(:, :)
         end subroutine jacobian_fun
     end interface
 
@@ -65,12 +63,32 @@ module trust_region_nls
 
 contains
 
-    subroutine trust_region_solve(residual, jacobian, n, u, p, opts, stats)
+    !!> Trust-region Newton solver using the NLsolve-style radius update.
+    !!
+    !! This routine solves a dense real nonlinear system `f(u, p) = 0` using a dogleg
+    !! trust-region step with the NLsolve radius update scheme (shrink on poor ratio,
+    !! expand on good ratio). The user must provide a residual and a dense Jacobian.
+    !!
+    !! **Globalization**: Dogleg step plus trust-region acceptance via ratio
+    !! `ρ = (||f(u + δ)||² - ||f(u)||²) / (2*(δᵀJᵀf + 0.5*||Jδ||²))`.
+    !!
+    !! **Termination** (real-valued): residual norm <= max(abs_tol, rel_tol*(1+||u||)),
+    !! step norm <= max(du_abs_tol, du_rel_tol*(1+||u||)) after an accepted step, or
+    !! stagnation (residual decrease below `stagnation_tol` for `stagnation_iters`
+    !! accepted steps). Max iterations and shrink-threshold exits are also enforced.
+    !!
+    !! **Retcodes**: 0 success, 1 max iters, 2 linear solve failure, 3 shrink exceeded,
+    !! 4 stagnation, 5 non-finite detected.
+    !!
+    !! @param residual   User residual callback `f(u, f_out)`
+    !! @param jacobian   User Jacobian callback `J(u, J_out)`
+    !! @param[in,out] u  Initial guess on input; solution estimate on output
+    !! @param opts       Solver options (tolerances, trust-region settings)
+    !! @param stats      Solver statistics (iterations, eval counts, retcode)
+    subroutine trust_region_solve(residual, jacobian, u, opts, stats)
         procedure(residual_fun) :: residual
         procedure(jacobian_fun) :: jacobian
-        integer, intent(in) :: n
-        real(dp), intent(inout) :: u(n)
-        real(dp), intent(in) :: p(:)
+        real(dp), intent(inout) :: u(:)
         type(trust_region_opts), intent(in), optional :: opts
         type(trust_region_stats), intent(inout), optional :: stats
 
@@ -88,23 +106,26 @@ contains
         real(dp) :: step_tol, norm_u
         real(dp) :: last_accepted_fnorm
         integer :: stagnation_count
+        integer :: n
 
         o = trust_region_opts()
         if (present(opts)) o = opts
         s = trust_region_stats()
         if (present(stats)) s = stats
 
+        n = size(u)
+
         allocate(f(n), f_trial(n), g(n), step(n), p_u(n), p_b(n))
         allocate(J(n, n), J_fact(n, n), rhs(n), Jg(n), Jstep(n))
 
-        call residual(n, u, p, f)
+        call residual(u, f)
         s%func_evals = s%func_evals + 1
         if (.not. is_finite_vec(f)) then
             s%retcode = 5
             goto 200
         end if
         ! Julia counts an initial Jacobian build; mirror that for stats alignment.
-        call jacobian(n, u, p, J)
+        call jacobian(u, J)
         s%jac_evals = s%jac_evals + 1
         fnorm = vec_norm2(f)
 
@@ -126,7 +147,7 @@ contains
             end if
 
             if (recompute_jacobian) then
-                call jacobian(n, u, p, J)
+                call jacobian(u, J)
                 s%jac_evals = s%jac_evals + 1
                 if (.not. is_finite_mat(J)) then
                     s%retcode = 5
@@ -147,7 +168,7 @@ contains
                     if (.not. tried_recompute .and. .not. recompute_jacobian) then
                         recompute_jacobian = .true.
                         tried_recompute = .true.
-                        call jacobian(n, u, p, J)
+                        call jacobian(u, J)
                         s%jac_evals = s%jac_evals + 1
                         J_fact = J
                         rhs = -f
@@ -166,7 +187,7 @@ contains
 
             step_norm = vec_norm2(step)
             f_trial = f
-            call residual(n, u + step, p, f_trial)
+            call residual(u + step, f_trial)
             s%func_evals = s%func_evals + 1
             if (.not. is_finite_vec(f_trial)) then
                 s%retcode = 5

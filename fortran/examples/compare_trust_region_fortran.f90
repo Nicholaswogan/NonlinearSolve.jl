@@ -7,7 +7,6 @@ program compare_trust_region_fortran
     integer, parameter :: n = 2
     integer, parameter :: reps = 100
     real(dp) :: u(n), u0(n)
-    real(dp) :: p(0)
     type(trust_region_opts) :: opts
     type(trust_region_stats) :: stats
     real(dp) :: t_start, t_end, fnorm
@@ -27,12 +26,12 @@ program compare_trust_region_fortran
     do k = 1, reps
         u = u0
         stats = trust_region_stats()
-        call trust_region_solve(residual, jacobian, n, u, p, opts, stats)
+        call trust_region_solve(residual, jacobian, u, opts, stats)
     end do
     call cpu_time(t_end)
     total_time = t_end - t_start
 
-    call residual(n, u, p, fval)
+    call residual(u, fval)
     fnorm = vec_norm2_local(fval)
 
     print *, "=== Fortran TrustRegion (NLsolve) ==="
@@ -50,19 +49,17 @@ program compare_trust_region_fortran
 
 contains
 
-    subroutine residual(n, u, p, f)
-        integer, intent(in) :: n
-        real(dp), intent(in) :: u(n), p(:)
-        real(dp), intent(out) :: f(n)
+    subroutine residual(u, f)
+        real(dp), intent(in) :: u(:)
+        real(dp), intent(out) :: f(:)
 
         f(1) = u(1) * u(1) + u(2) * u(2) - 1.0_dp
         f(2) = u(1) - u(2)
     end subroutine residual
 
-    subroutine jacobian(n, u, p, J)
-        integer, intent(in) :: n
-        real(dp), intent(in) :: u(n), p(:)
-        real(dp), intent(out) :: J(n, n)
+    subroutine jacobian(u, J)
+        real(dp), intent(in) :: u(:)
+        real(dp), intent(out) :: J(:, :)
 
         J(1, 1) = 2.0_dp * u(1)
         J(1, 2) = 2.0_dp * u(2)

@@ -22,8 +22,8 @@ function main()
         end,
         jac = (u, p) -> begin
             J = zeros(eltype(u), 2, 2)
-            J[1, 1] = 2u[1]
-            J[1, 2] = 2u[2]
+            J[1, 1] = 2 * u[1]
+            J[1, 2] = 2 * u[2]
             J[2, 1] = 1
             J[2, 2] = -1
             J
