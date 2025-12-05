@@ -27,7 +27,8 @@ program run_test_nonlin
     nopts_bt = newton_opts()
     nopts%abs_tol = opts%abs_tol
     nopts%rel_tol = opts%rel_tol
-    nopts%max_iters = opts%max_iters
+    nopts%max_iters = 1000
+    nopts%stagnation_iters = 1000
     nopts_bt = nopts
     nopts_bt%use_backtracking = .true.
 

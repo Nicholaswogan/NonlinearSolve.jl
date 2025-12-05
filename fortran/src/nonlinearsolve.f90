@@ -38,13 +38,13 @@ module nonlinearsolve
     end type trust_region_stats
 
     type :: newton_opts
-        integer :: max_iters = 100
+        integer :: max_iters = 1000
         real(dp) :: abs_tol = 1.0e-8_dp
         real(dp) :: rel_tol = 1.0e-8_dp
         real(dp) :: du_abs_tol = 1.0e-10_dp
         real(dp) :: du_rel_tol = 1.0e-10_dp
         real(dp) :: stagnation_tol = 1.0e-12_dp
-        integer :: stagnation_iters = 10
+        integer :: stagnation_iters = 1000
         logical :: use_backtracking = .false.
         real(dp) :: bt_c1 = 1.0e-4_dp
         real(dp) :: bt_rho_hi = 0.5_dp
@@ -247,14 +247,14 @@ contains
                 fnorm = fnorm_trial
                 recompute_jacobian = .true.
 
-                norm_u = vec_norm2(u)
-                step_tol = max(o%du_abs_tol, o%du_rel_tol * (1.0_dp + norm_u))
-                if (step_norm <= step_tol .or. fnorm <= max(o%abs_tol, o%rel_tol * (1.0_dp + norm_u))) then
-                    s%iters = s%iters + 1
-                    s%converged = .true.
-                    s%retcode = 0
-                    exit
-                end if
+            norm_u = vec_norm2(u)
+            step_tol = max(o%du_abs_tol, o%du_rel_tol * (1.0_dp + norm_u))
+            if (fnorm <= max(o%abs_tol, o%rel_tol * (1.0_dp + norm_u))) then
+                s%iters = s%iters + 1
+                s%converged = .true.
+                s%retcode = 0
+                exit
+            end if
 
                 if ((last_accepted_fnorm - fnorm) <= o%stagnation_tol * max(1.0_dp, last_accepted_fnorm)) then
                     stagnation_count = stagnation_count + 1
@@ -309,10 +309,13 @@ contains
 
         integer :: n, info
         real(dp), allocatable :: f(:), f_trial(:), rhs(:)
+        real(dp), allocatable :: u_prev(:), f_prev(:)
+        real(dp), allocatable :: u_best(:), f_best(:)
         real(dp), allocatable :: J(:, :), J_fact(:, :)
         real(dp), allocatable :: Jdelta(:)
         real(dp) :: fnorm, fnorm_trial, step_norm
         real(dp) :: numerator
+        real(dp) :: best_fnorm
         logical :: tried_recompute, accept_step
         real(dp) :: step_tol, norm_u
         real(dp) :: last_accepted_fnorm
@@ -328,6 +331,8 @@ contains
 
         n = size(u)
         allocate(f(n), f_trial(n), rhs(n))
+        allocate(u_prev(n), f_prev(n))
+        allocate(u_best(n), f_best(n))
         allocate(J(n, n), J_fact(n, n))
         allocate(Jdelta(n))
 
@@ -337,6 +342,11 @@ contains
             s%retcode = 5
             goto 500
         end if
+        u_prev = u
+        f_prev = f
+        u_best = u
+        f_best = f
+        best_fnorm = vec_norm2(f)
         call jacobian(u, J)
         s%jac_evals = s%jac_evals + 1
         fnorm = vec_norm2(f)
@@ -464,6 +474,8 @@ solve_attempt_newton: do
                 fnorm_trial = vec_norm2(f_trial)
             end if
 
+            u_prev = u
+            f_prev = f
             u = u + rhs
             if (o%use_backtracking) then
                 call residual(u, f)
@@ -474,13 +486,17 @@ solve_attempt_newton: do
                 end if
                 fnorm = vec_norm2(f)
             else
+                if (.not. is_finite_vec(f_trial)) then
+                    s%retcode = 5
+                    exit
+                end if
                 f = f_trial
                 fnorm = vec_norm2(f_trial)
             end if
 
             norm_u = vec_norm2(u)
             step_tol = max(o%du_abs_tol, o%du_rel_tol * (1.0_dp + norm_u))
-            if (step_norm <= step_tol .or. fnorm <= max(o%abs_tol, o%rel_tol * (1.0_dp + norm_u))) then
+            if (step_norm <= step_tol .and. fnorm <= max(o%abs_tol, o%rel_tol * (1.0_dp + norm_u))) then
                 s%iters = s%iters + 1
                 s%converged = .true.
                 s%retcode = 0
@@ -493,6 +509,11 @@ solve_attempt_newton: do
                 stagnation_count = 0
             end if
             last_accepted_fnorm = fnorm
+            if (fnorm < best_fnorm) then
+                u_best = u
+                f_best = f
+                best_fnorm = fnorm
+            end if
 
             if (stagnation_count >= o%stagnation_iters) then
                 s%iters = s%iters + 1
@@ -501,18 +522,33 @@ solve_attempt_newton: do
             end if
 
             s%iters = s%iters + 1
+            u_prev = u
+            f_prev = f
         end do
 
         if (.not. s%converged .and. s%retcode == 0) then
             s%retcode = 1
         end if
         if (s%retcode == 0) then
-            s%func_evals = s%func_evals + 1
+            if (fnorm > max(o%abs_tol, o%rel_tol * (1.0_dp + vec_norm2(u)))) then
+                s%func_evals = s%func_evals + 1
+                s%jac_evals = s%jac_evals + 1
+                s%lin_solves = s%lin_solves + 1
+            else
+                s%func_evals = s%func_evals + 1
+            end if
+        end if
+        if (s%retcode /= 0) then
+            u = u_best
+            f = f_best
+            if (s%retcode == 5) then
+                s%func_evals = s%func_evals + 1
+            end if
         end if
 
 500     if (present(stats)) stats = s
 
-        deallocate(f, f_trial, rhs, J, J_fact, Jdelta)
+        deallocate(f, f_trial, rhs, J, J_fact, Jdelta, u_prev, f_prev, u_best, f_best)
     end subroutine newton_solve
 
     subroutine solve_linear_system(n, A, b, info)
