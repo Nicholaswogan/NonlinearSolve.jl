@@ -147,7 +147,7 @@ function main()
     println(fmt_row(header...))
     println(repeat("-", 150))
     for js in julia_stats
-        if js.solver == "NR"
+        if true
             ft = get(fortran_records, (js.prob, js.solver), nothing)
             nf_ft = ft === nothing ? "n/a" : string(ft.nf)
             r_ft = ft === nothing ? "n/a" : begin
